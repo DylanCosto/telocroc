@@ -1,0 +1,48 @@
+[package]
+name = "telocroc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "Fast allele-specific telomere length from long reads"
+license = "MIT"
+
+[[bin]]
+name = "telocroc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+crossbeam-channel = "0.5.15"
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+memchr = "2.8.3"
+mimalloc = "0.1.52"
+pprof = { version = "0.15.0", features = ["flamegraph"], optional = true }
+rayon = "1.12.0"
+rust-htslib = { version = "1.0.2", default-features = false, features = ["bzip2", "lzma", "libdeflate"] }
+
+[features]
+# Sampling CPU profiler: set TELOCROC_PROFILE=prefix to write prefix.svg (flame graph)
+# and prefix.txt (functions by inclusive and self time).
+profile = ["dep:pprof"]
+
+[dev-dependencies]
+serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+
+# Release build with line tables, for profiling (cargo build --profile profiling)
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"

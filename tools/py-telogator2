@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Runs upstream Telogator2 (pinned checkout in ../upstream) for comparisons.
+# Set TELOGATOR2_PYTHON to a Python with Telogator2's dependencies (default: python3).
+here="$(cd "$(dirname "$0")" && pwd)"
+PYTHONPATH="$here/../upstream${PYTHONPATH:+:$PYTHONPATH}" exec "${TELOGATOR2_PYTHON:-python3}" "$here/../upstream/telogator2.py" "$@"

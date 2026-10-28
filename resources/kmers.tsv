@@ -1,0 +1,74 @@
+# canonical
+CCCTAA	blue	C	canonical
+CCTGG	blue	C	canonical,nanopore_only
+TTTTAA	blue	C	canonical,nanopore_only
+
+# C-type + variations
+CCCTGA	red	D	tvr,nofilt
+CCTGA	darkred	E	tvr
+CCTTGA	darkred	E	tvr
+CGCTGA	darkred	E	tvr
+CCGTGA	darkred	E	tvr
+CCCTTGA	darkred	E	tvr
+CCCTGGA	darkred	E	tvr
+CCCAGGA	darkred	E	tvr
+CCGCTGA	darkred	E	tvr
+
+# G-type + variations
+CCCTCA	yellow	F	tvr,nofilt
+CCTCA	gold	G	tvr,nofilt
+CCGTCA	gold	G	tvr,nofilt
+
+# J-type + variations
+CCCCAA	green	H	denoise,tvr
+CCCCCA	lightgreen	I	denoise,tvr
+CCCAAA	lightgreen	I	denoise,tvr
+
+# other variations
+CCCTCG	tan	K	tvr,nofilt
+CCCTAG	orange	L	tvr,nofilt
+CCCCTAG	darkorange	M	tvr
+CCTAG	darkorange	M	tvr
+CCCGAA	violet	N	tvr
+CCCGA	darkviolet	P	tvr
+CCCCGA	darkviolet	P	tvr
+CCCGGA	darkviolet	P	tvr
+CCGGAA	darkviolet	P	tvr
+CCCCGAA	darkviolet	P	tvr
+CCCCAG	purple	R	tvr
+
+# rare variations (usually singletons)
+CCCTCTAA	cyan	S	tvr,nofilt
+CCCATAA	cyan	S	tvr,nofilt
+CTCTAA	cyan	S	tvr,nofilt
+CGCTAA	cyan	S	tvr,nofilt
+CCGTAA	cyan	S	tvr,nofilt
+CCTGAA	cyan	S	tvr,nofilt
+CCCAGT	cyan	S	tvr,nofilt
+CCCGTA	cyan	S	tvr,nofilt
+CCCCCG	pink	Q	tvr,subtel-filt
+CCCTGG	pink	Q	tvr,subtel-filt
+
+# canonical indel variations
+CCCTTA	darkcyan	T	tvr
+CCTTAA	darkcyan	T	tvr
+CCCTTAA	darkcyan	T	tvr
+CCCCTA	slateblue	V	tvr,dubious
+CCCCTAA	slateblue	V	tvr,dubious
+CCCTAAA	slateblue	V	tvr,dubious
+CCCCCTAA	slateblue	V	tvr,dubious
+CCCTAAAA	slateblue	V	tvr,dubious
+CCCCTACCCTAACCCCTA	slateblue	V	tvr,dubious,hor
+CCCCTAACCCTAACCCCTAA	slateblue	V	tvr,dubious,hor
+
+# likely sequencing errors
+CCTA	darkblue	W	denoise,dubious
+CCTAA	darkblue	W	denoise,dubious
+CCCTA	darkblue	W	denoise,dubious
+CCCTCC	darkgreen	Y	denoise,dubious
+CCCCCC	darkgreen	Y	denoise,dubious
+CCCAA	darkgreen	Y	denoise,dubious
+CCCA	darkgreen	Y	denoise,dubious
+CCAA	darkgreen	Y	denoise,dubious
+CCA	darkgreen	Y	denoise,dubious
+CAA	darkgreen	Y	denoise,dubious

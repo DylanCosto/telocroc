@@ -1,0 +1,6 @@
+/target
+/upstream
+/validation
+/tools/minimap2
+/resources/telogator-ref*
+/.envrc.build

@@ -39,6 +39,8 @@
 
 ## Release
 
-- [ ] Ask the Telogator2 maintainers before going public; add the paper citation.
-- [ ] `Cargo.toml` metadata (`repository`, `readme`, `keywords`), version tags, prebuilt
-      binaries, a bioconda recipe.
+- [ ] Ask the Telogator2 maintainers before going public.
+- [x] Paper citation (`CITATION.cff`, README), `Cargo.toml` metadata.
+- [x] Prebuilt binaries: pushing a `v*` tag builds Linux x86-64/aarch64 (glibc 2.28) and
+      macOS arm64 tarballs into a draft release (`.github/workflows/release.yml`).
+- [ ] Tag v0.1.0 once CI runs; a bioconda recipe.

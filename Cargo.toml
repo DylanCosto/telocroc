@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.87"
 description = "Fast allele-specific telomere length from long reads"
 license = "MIT"
+repository = "https://github.com/DylanCosto/telocroc"
+readme = "README.md"
+keywords = ["telomere", "bioinformatics", "genomics", "long-reads", "pacbio"]
+categories = ["science", "command-line-utilities"]
 
 [[bin]]
 name = "telocroc"

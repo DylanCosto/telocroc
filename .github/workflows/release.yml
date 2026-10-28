@@ -1,0 +1,84 @@
+name: Release
+
+# Pushing a tag such as v0.1.0 builds the binaries and opens a draft release with them.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: ${{ matrix.arch }} Linux
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-24.04
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    # glibc 2.28 (RHEL 8 and newer), for older cluster nodes.
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust and libclang
+        run: |
+          dnf install -y clang-devel
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Check the tag matches Cargo.toml
+        run: test "${GITHUB_REF_NAME#v}" = "$(cargo pkgid | sed 's/.*[#@]//')"
+      - run: cargo build --release --locked
+      - name: Check the binary links only to the C runtime
+        run: |
+          ldd target/release/telocroc
+          if ldd target/release/telocroc | grep -v -E 'linux-vdso|ld-linux|lib(c|m|gcc_s|pthread|dl|rt)\.so'; then
+            exit 1
+          fi
+      - run: scripts/package.sh ${{ matrix.arch }}-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}-linux
+          path: dist/*
+
+  macos:
+    name: aarch64 macOS
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: Check the binary links only to system libraries
+        run: |
+          otool -L target/release/telocroc
+          if otool -L target/release/telocroc | tail -n +2 | grep -v -E '^\s+/(usr/lib|System)/'; then
+            exit 1
+          fi
+      - run: scripts/package.sh aarch64-macos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-macos
+          path: dist/*
+
+  release:
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --generate-notes \
+            --title "telocroc $GITHUB_REF_NAME" *.tar.gz SHA256SUMS

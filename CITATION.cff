@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: >-
+  telocroc implements the Telogator2 method. If you use it, please cite the Telogator2 paper.
+title: telocroc
+type: software
+authors:
+  - given-names: Dylan
+    family-names: Costo
+repository-code: https://github.com/DylanCosto/telocroc
+license: MIT
+version: 0.1.0
+preferred-citation:
+  type: article
+  title: >-
+    Characterization of telomere variant repeats using long reads enables allele-specific
+    telomere length estimation
+  authors:
+    - family-names: Stephens
+      given-names: Zachary
+    - family-names: Kocher
+      given-names: Jean-Pierre
+  journal: BMC Bioinformatics
+  volume: 25
+  issue: 1
+  start: 194
+  year: 2024
+  doi: 10.1186/s12859-024-05807-5

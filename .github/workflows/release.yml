@@ -78,7 +78,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cd dist
-          sha256sum *.tar.gz > SHA256SUMS
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --generate-notes \
-            --title "telocroc $GITHUB_REF_NAME" *.tar.gz SHA256SUMS
+            --title "telocroc $GITHUB_REF_NAME" dist/*.tar.gz

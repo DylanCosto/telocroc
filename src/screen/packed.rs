@@ -68,12 +68,17 @@ impl PackedPrefilter {
     fn count_hits(&self, packed: &[u8], len: usize, limit: usize) -> [usize; 2] {
         let packed = &packed[..len.div_ceil(2)];
         let mut counts = [0; 2];
-        let mut start = 0;
         #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("avx2") {
+        let start = if is_x86_feature_detected!("avx2") {
             // SAFETY: AVX2 support was checked at runtime just above.
-            start = unsafe { self.scan_avx2(packed, len, limit, &mut counts) };
-        }
+            unsafe { self.scan_avx2(packed, len, limit, &mut counts) }
+        } else {
+            0
+        };
+        #[cfg(target_arch = "aarch64")]
+        let start = self.scan_neon(packed, len, limit, &mut counts);
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let start = 0;
         for j in start..packed.len().saturating_sub(2) {
             if counts.iter().any(|&n| n >= limit) {
                 break;
@@ -131,6 +136,47 @@ impl PackedPrefilter {
             while mask != 0 {
                 self.check_byte(packed, len, j + mask.trailing_zeros() as usize, counts);
                 mask &= mask - 1;
+            }
+            if counts.iter().any(|&n| n >= limit) {
+                return packed.len();
+            }
+            j += 32;
+        }
+        j
+    }
+
+    /// Checks anchors 32 bytes at a time (two 16-byte halves), from byte 0 while 34 bytes
+    /// remain. Returns the first byte not yet checked.
+    #[cfg(target_arch = "aarch64")]
+    fn scan_neon(&self, packed: &[u8], len: usize, limit: usize, counts: &mut [usize; 2]) -> usize {
+        use std::arch::aarch64::{
+            vandq_u8, vceqq_u8, vdupq_n_u8, vget_lane_u64, vld1q_u8, vorrq_u8, vreinterpret_u64_u8,
+            vreinterpretq_u16_u8, vshrn_n_u16,
+        };
+
+        use crate::neon::neon;
+        let want = self.anchors.map(|a| a.bytes.map(|b| neon!(vdupq_n_u8(b))));
+        let mut j = 0;
+        while j + 34 <= packed.len() {
+            for at in [j, j + 16] {
+                // SAFETY: at + 2 + 16 <= j + 34 <= packed.len(), so all three unaligned loads
+                // are in bounds.
+                let v = unsafe { [0, 1, 2].map(|o| vld1q_u8(packed.as_ptr().add(at + o))) };
+                let hit = want.iter().fold(neon!(vdupq_n_u8(0)), |hit, w| {
+                    neon!(vorrq_u8(
+                        hit,
+                        vandq_u8(vandq_u8(vceqq_u8(v[0], w[0]), vceqq_u8(v[1], w[1])), vceqq_u8(v[2], w[2]))
+                    ))
+                });
+                // No movemask on NEON: narrowing each 16-bit pair by 4 bits leaves 4 bits per
+                // byte, byte k at bits 4k..4k + 4; keep one of them.
+                let nibbles =
+                    neon!(vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(hit)))));
+                let mut mask = nibbles & 0x8888_8888_8888_8888;
+                while mask != 0 {
+                    self.check_byte(packed, len, at + mask.trailing_zeros() as usize / 4, counts);
+                    mask &= mask - 1;
+                }
             }
             if counts.iter().any(|&n| n >= limit) {
                 return packed.len();

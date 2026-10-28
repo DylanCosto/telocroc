@@ -1,4 +1,4 @@
-//! Global alignment with traceback in Farrar's striped SIMD layout (AVX2), producing the
+//! Global alignment with traceback in Farrar's striped SIMD layout (AVX2 or NEON), producing the
 //! same first optimal alignment as [`super::gotoh::align`] (Biopython's).
 //!
 //! Vertical gaps are resolved per column with a scan across lanes (Daily's "striped
@@ -23,6 +23,8 @@ pub struct TraceBuffers {
     enc: ScoreBuffers,
     #[cfg(target_arch = "x86_64")]
     simd: avx2::Buffers,
+    #[cfg(target_arch = "aarch64")]
+    simd: neon::Buffers,
     /// Trace bytes, starting at `trace_start` (32-byte aligned for streaming stores).
     trace: Vec<u8>,
     trace_start: usize,
@@ -35,6 +37,18 @@ pub struct TraceBuffers {
 /// Panics if either sequence is empty.
 pub fn align(a: &[u8], b: &[u8], scoring: &Scoring, buf: &mut TraceBuffers) -> (Vec<u8>, Vec<u8>) {
     assert!(!a.is_empty() && !b.is_empty(), "cannot align an empty sequence");
+    #[cfg(target_arch = "aarch64")]
+    {
+        buf.enc.encode(a, b, &scoring.sub);
+        let frame = frame_i16(a.len(), b.len(), scoring, &buf.enc.table);
+        let lanes = if neon::fill_i16(buf, scoring, frame) {
+            16
+        } else {
+            neon::fill_i32(buf, scoring);
+            8
+        };
+        return traceback(a, b, &buf.trace[buf.trace_start..], a.len().div_ceil(lanes), lanes);
+    }
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") {
         buf.enc.encode(a, b, &scoring.sub);
@@ -50,6 +64,7 @@ pub fn align(a: &[u8], b: &[u8], scoring: &Scoring, buf: &mut TraceBuffers) -> (
         };
         return traceback(a, b, &buf.trace[buf.trace_start..], a.len().div_ceil(lanes), lanes);
     }
+    #[allow(unreachable_code, reason = "aarch64 always returns above")]
     gotoh::align(a, b, scoring, &mut gotoh::AlignBuffers::default())
 }
 
@@ -142,11 +157,80 @@ fn traceback(a: &[u8], b: &[u8], trace: &[u8], segs: usize, lanes: usize) -> (Ve
     (row_a, row_b)
 }
 
+/// The last row and column of a free-trailing-gap alignment, in exact scalar
+/// arithmetic, writing the same trace bits as the vector fill would.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+struct ScalarEnds {
+    m: usize,
+    n: usize,
+    segs: usize,
+    lanes: usize,
+    col_bytes: usize,
+    end_open: i32,
+    end_ext: i32,
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl ScalarEnds {
+    fn cell(&self, row: usize, col: usize) -> usize {
+        (col - 1) * self.col_bytes + (row - 1) % self.segs * self.lanes + (row - 1) / self.segs
+    }
+
+    /// A trace field's flags: whether the M and the Ix candidates equal `target`.
+    fn flags(m: i32, ix: i32, target: i32) -> u8 {
+        u8::from(m == target) | (u8::from(ix == target) << 1)
+    }
+
+    /// `last_row`: (M, Ix) of row m in columns 1..n; `h`, `iy`: H and the Iy entering
+    /// column n, by row (row m's Iy is recomputed here).
+    fn fill(
+        &self,
+        enc: &ScoreBuffers,
+        scoring: &Scoring,
+        last_row: &[(i32, i32)],
+        h: &[i32],
+        iy: &mut [i32],
+        trace: &mut [u8],
+    ) {
+        let (m, n, k) = (self.m, self.n, enc.alphabet);
+        let sub = |row: usize, col: usize| enc.table[enc.codes_a[row - 1] as usize * k + enc.codes_b[col - 1] as usize];
+        // Row m, columns 1..n: Iy extends along the row at the trailing-gap cost.
+        let mut iy_m = scoring.left_gap(m) + self.end_open;
+        for (col, &(vm, ix)) in (1..).zip(last_row) {
+            let hm = vm.max(ix).max(iy_m);
+            let iy_next = (iy_m + self.end_ext).max(hm + self.end_open);
+            let byte = &mut trace[self.cell(m, col)];
+            let next = Self::flags(vm + self.end_open, ix + self.end_open, iy_next);
+            *byte = (*byte & 0b1100) | Self::flags(vm, ix, hm) | (next << 4);
+            iy_m = iy_next;
+        }
+        iy[m] = iy_m;
+        // Column n, top to bottom: Ix extends down the column at the trailing-gap cost.
+        let mut diag = if n == 1 { 0 } else { scoring.left_gap(n - 1) };
+        let mut ix = scoring.left_gap(n) + self.end_open;
+        let (mut up_m, mut up_ix) = (i32::MIN / 4, i32::MIN / 4);
+        for row in 1..=m {
+            if row > 1 {
+                ix = (ix + self.end_ext).max(up_m.max(iy[row - 1]) + self.end_open);
+            }
+            let vm = diag + sub(row, n);
+            let hc = vm.max(iy[row]).max(ix);
+            // Row 1's Ix comes from the top border, decoded from no flags.
+            let from = if row == 1 { 0 } else { Self::flags(up_m + self.end_open, up_ix + self.end_ext, ix) };
+            let (eo, ee) = if row == m { (self.end_open, self.end_ext) } else { (scoring.open, scoring.extend) };
+            let iy_next = (iy[row] + ee).max(hc + eo);
+            let next = Self::flags(vm + eo, ix + eo, iy_next);
+            trace[self.cell(row, n)] = Self::flags(vm, ix, hc) | (from << 2) | (next << 4);
+            (up_m, up_ix, diag) = (vm, ix, h[row]);
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
     use std::arch::x86_64::*;
 
-    use super::{Frame, REBASE_COLUMNS, Scoring, TraceBuffers};
+    use super::{Frame, REBASE_COLUMNS, ScalarEnds, Scoring, TraceBuffers};
 
     #[derive(Debug, Default)]
     pub(super) struct Buffers {
@@ -202,74 +286,6 @@ mod avx2 {
         let p = &p[..8];
         // SAFETY: `p` is 8 readable bytes; the load is unaligned.
         _mm256_cvtepi8_epi32(unsafe { _mm_loadl_epi64(p.as_ptr().cast()) })
-    }
-
-    /// The last row and column of a free-trailing-gap alignment, in exact scalar
-    /// arithmetic, writing the same trace bits as the vector fill would.
-    struct ScalarEnds {
-        m: usize,
-        n: usize,
-        segs: usize,
-        lanes: usize,
-        col_bytes: usize,
-        end_open: i32,
-        end_ext: i32,
-    }
-
-    impl ScalarEnds {
-        fn cell(&self, row: usize, col: usize) -> usize {
-            (col - 1) * self.col_bytes + (row - 1) % self.segs * self.lanes + (row - 1) / self.segs
-        }
-
-        /// A trace field's flags: whether the M and the Ix candidates equal `target`.
-        fn flags(m: i32, ix: i32, target: i32) -> u8 {
-            u8::from(m == target) | (u8::from(ix == target) << 1)
-        }
-
-        /// `last_row`: (M, Ix) of row m in columns 1..n; `h`, `iy`: H and the Iy entering
-        /// column n, by row (row m's Iy is recomputed here).
-        fn fill(
-            &self,
-            enc: &super::ScoreBuffers,
-            scoring: &Scoring,
-            last_row: &[(i32, i32)],
-            h: &[i32],
-            iy: &mut [i32],
-            trace: &mut [u8],
-        ) {
-            let (m, n, k) = (self.m, self.n, enc.alphabet);
-            let sub =
-                |row: usize, col: usize| enc.table[enc.codes_a[row - 1] as usize * k + enc.codes_b[col - 1] as usize];
-            // Row m, columns 1..n: Iy extends along the row at the trailing-gap cost.
-            let mut iy_m = scoring.left_gap(m) + self.end_open;
-            for (col, &(vm, ix)) in (1..).zip(last_row) {
-                let hm = vm.max(ix).max(iy_m);
-                let iy_next = (iy_m + self.end_ext).max(hm + self.end_open);
-                let byte = &mut trace[self.cell(m, col)];
-                let next = Self::flags(vm + self.end_open, ix + self.end_open, iy_next);
-                *byte = (*byte & 0b1100) | Self::flags(vm, ix, hm) | (next << 4);
-                iy_m = iy_next;
-            }
-            iy[m] = iy_m;
-            // Column n, top to bottom: Ix extends down the column at the trailing-gap cost.
-            let mut diag = if n == 1 { 0 } else { scoring.left_gap(n - 1) };
-            let mut ix = scoring.left_gap(n) + self.end_open;
-            let (mut up_m, mut up_ix) = (i32::MIN / 4, i32::MIN / 4);
-            for row in 1..=m {
-                if row > 1 {
-                    ix = (ix + self.end_ext).max(up_m.max(iy[row - 1]) + self.end_open);
-                }
-                let vm = diag + sub(row, n);
-                let hc = vm.max(iy[row]).max(ix);
-                // Row 1's Ix comes from the top border, decoded from no flags.
-                let from = if row == 1 { 0 } else { Self::flags(up_m + self.end_open, up_ix + self.end_ext, ix) };
-                let (eo, ee) = if row == m { (self.end_open, self.end_ext) } else { (scoring.open, scoring.extend) };
-                let iy_next = (iy[row] + ee).max(hc + eo);
-                let next = Self::flags(vm + eo, ix + eo, iy_next);
-                trace[self.cell(row, n)] = Self::flags(vm, ix, hc) | (from << 2) | (next << 4);
-                (up_m, up_ix, diag) = (vm, ix, h[row]);
-            }
-        }
     }
 
     macro_rules! trace_kernel {
@@ -592,6 +608,315 @@ mod avx2 {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    //! The AVX2 kernel's algorithm, generic over the lane width rather than expanded from a
+    //! macro. Trace bytes use ordinary stores (NEON has no streaming store intrinsic).
+
+    use super::{Frame, REBASE_COLUMNS, ScalarEnds, Scoring, TraceBuffers};
+    use crate::neon::{I16x16, I32x8, Lanes};
+
+    /// The buffers of one lane width.
+    #[derive(Debug)]
+    pub(super) struct Vecs<V> {
+        /// Substitution scores per letter of `b`, as bytes in striped order.
+        profile: Vec<i8>,
+        slot: Vec<usize>,
+        h_prev: Vec<V>,
+        h_cur: Vec<V>,
+        e: Vec<V>,
+        f_local: Vec<V>,
+        /// M of each segment in the current column, from pass 1 for pass 2.
+        m_local: Vec<V>,
+        /// (M, Ix) of the last row in each column, for [`ScalarEnds`].
+        last_row: Vec<(i32, i32)>,
+        /// H and Iy of every row in the second-to-last column, likewise.
+        last_h: Vec<i32>,
+        last_iy: Vec<i32>,
+    }
+
+    impl<V> Default for Vecs<V> {
+        fn default() -> Self {
+            Self {
+                profile: Vec::new(),
+                slot: Vec::new(),
+                h_prev: Vec::new(),
+                h_cur: Vec::new(),
+                e: Vec::new(),
+                f_local: Vec::new(),
+                m_local: Vec::new(),
+                last_row: Vec::new(),
+                last_h: Vec::new(),
+                last_iy: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    pub(super) struct Buffers {
+        w16: Vecs<I16x16>,
+        w32: Vecs<I32x8>,
+    }
+
+    /// A lane width, with its buffers.
+    trait Width<const L: usize>: Lanes<L> {
+        fn vecs(buf: &mut Buffers) -> &mut Vecs<Self>;
+    }
+
+    impl Width<16> for I16x16 {
+        fn vecs(buf: &mut Buffers) -> &mut Vecs<Self> {
+            &mut buf.w16
+        }
+    }
+
+    impl Width<8> for I32x8 {
+        fn vecs(buf: &mut Buffers) -> &mut Vecs<Self> {
+            &mut buf.w32
+        }
+    }
+
+    /// Fills the trace. Returns `false` if scores left the range where this lane width is
+    /// exact (`limit`, less the largest lane shift).
+    ///
+    /// Scores are stored relative to per-lane offsets set by `frame` (comparisons and the
+    /// trace do not depend on them). With `TRACK` false the range is not checked, for
+    /// frames whose bounds already guarantee it.
+    fn fill<const L: usize, V: Width<L>, const TRACK: bool>(
+        buf: &mut TraceBuffers,
+        scoring: &Scoring,
+        frame: Frame,
+        limit: i32,
+    ) -> bool {
+        let enc = &buf.enc;
+        let (m, n) = (enc.codes_a.len(), enc.codes_b.len());
+        let segs = m.div_ceil(L);
+        let k = enc.alphabet;
+        let clamp = |v: i32| V::cast(v.clamp(V::NEG.into(), V::MAX.into()));
+        let splat = |v: i32| V::splat(V::cast(v));
+        let gap = |len: usize| scoring.left_gap(len);
+        // true score = stored + off[lane]
+        let mut off: [i32; L] = match frame {
+            Frame::Centred(bias) => [-bias; L],
+            Frame::PerLane => std::array::from_fn(|lane| gap(lane * segs + 1)),
+        };
+        // Added after shifting a vector down one lane, to move each value into the frame
+        // of the lane it lands in. Lane 0 receives the inserted value as is.
+        let lane_shift = |off: &[i32; L]| -> ([i32; L], i32) {
+            let d: [i32; L] = std::array::from_fn(|l| if l == 0 { 0 } else { off[l - 1] - off[l] });
+            (d, d.iter().map(|x| x.abs()).max().unwrap_or(0))
+        };
+        let (mut shift, mut max_shift) = lane_shift(&off);
+        if max_shift >= limit / 2 {
+            return false;
+        }
+        let mut v_shift = V::from_array(shift.map(V::cast));
+        // A trace field's two flags (M ties, Ix ties), already at the field's bits.
+        let field_bits = |shift: u32| (splat(1 << shift), splat(2 << shift));
+        let (best_bits, ix_bits) = (field_bits(0), field_bits(2));
+        let flags = |(m_bit, ix_bit): (V, V), eq_m: V, eq_f: V| eq_m.and(m_bit).or(eq_f.and(ix_bit));
+        // Free trailing gaps let the last row and column climb to their running maximum,
+        // far from their lanes' offsets in the per-lane frame. There the fill uses ordinary
+        // gaps (nothing else depends on those cells) and the last row and column are redone
+        // exactly in scalar code.
+        let scalar_ends = matches!(frame, Frame::PerLane) && scoring.free_right_gaps;
+        let (end_open, end_ext) = if scoring.free_right_gaps { (0, 0) } else { (scoring.open, scoring.extend) };
+        let (right_open, right_ext) = if scalar_ends { (scoring.open, scoring.extend) } else { (end_open, end_ext) };
+        let (last_seg, last_lane) = ((m - 1) % segs, (m - 1) / segs);
+        let (v_open, v_ext) = (splat(scoring.open), splat(scoring.extend));
+        // Horizontal (Iy) gap scores for the segment holding the last row, whose trailing
+        // gaps may be free.
+        let (last_open, last_ext) = {
+            let (mut o, mut e) = ([V::cast(scoring.open); L], [V::cast(scoring.extend); L]);
+            o[last_lane] = V::cast(right_open);
+            e[last_lane] = V::cast(right_ext);
+            (V::from_array(o), V::from_array(e))
+        };
+
+        let s = V::vecs(&mut buf.simd);
+        s.slot.clear();
+        s.slot.resize(k, usize::MAX);
+        s.profile.clear();
+        for &c in &enc.codes_b {
+            let c = c as usize;
+            if s.slot[c] != usize::MAX {
+                continue;
+            }
+            s.slot[c] = s.profile.len() / (segs * L);
+            for t in 0..segs {
+                for lane in 0..L {
+                    let row = lane * segs + t;
+                    let v = if row < m { enc.table[enc.codes_a[row] as usize * k + c] } else { 0 };
+                    s.profile.push(i8::try_from(v).expect("substitution scores fit in a byte"));
+                }
+            }
+        }
+        // Column 0: H = Ix = leading vertical gap; the first Iy opens from it.
+        let rows = |t: usize| -> [usize; L] { std::array::from_fn(|lane| lane * segs + t + 1) };
+        s.h_prev.clear();
+        s.e.clear();
+        for t in 0..segs {
+            let r = rows(t);
+            s.h_prev.push(V::from_array(std::array::from_fn(|lane| clamp(gap(r[lane]) - off[lane]))));
+            s.e.push(V::from_array(std::array::from_fn(|lane| {
+                let open = if t == last_seg && lane == last_lane { right_open } else { scoring.open };
+                clamp(gap(r[lane]) + open - off[lane])
+            })));
+        }
+        let neg = V::splat(V::NEG);
+        s.h_cur.clear();
+        s.h_cur.resize(segs, neg);
+        s.f_local.clear();
+        s.f_local.resize(segs, neg);
+        s.m_local.clear();
+        s.m_local.resize(segs, neg);
+        // every byte is overwritten below, so only grow the buffer
+        let col_bytes = segs * L;
+        if buf.trace.len() < n * col_bytes + 32 {
+            buf.trace.resize(n * col_bytes + 32, 0);
+        }
+        buf.trace_start = buf.trace.as_ptr().align_offset(32);
+        let trace = &mut buf.trace[buf.trace_start..];
+
+        let mut v_min = splat(0);
+        let mut v_max = splat(0);
+        s.last_row.clear();
+        for (j, &c) in enc.codes_b.iter().enumerate() {
+            if scalar_ends && j == n - 1 {
+                break;
+            }
+            if matches!(frame, Frame::PerLane) && j > 0 && j % REBASE_COLUMNS == 0 {
+                // Each lane's first row becomes its new zero.
+                let v_d = s.h_prev[0];
+                for t in 0..segs {
+                    s.h_prev[t] = s.h_prev[t].sub(v_d);
+                    s.e[t] = s.e[t].sub(v_d);
+                }
+                for (o, x) in off.iter_mut().zip(v_d.to_array()) {
+                    *o += x.into();
+                }
+                let (d, m) = lane_shift(&off);
+                (shift, max_shift) = (d, max_shift.max(m));
+                if max_shift >= limit / 2 {
+                    return false;
+                }
+                v_shift = V::from_array(shift.map(V::cast));
+            }
+            let col = j + 1;
+            let (f_open_s, f_ext_s) = if col == n { (right_open, right_ext) } else { (scoring.open, scoring.extend) };
+            let (f_open, f_ext) = (splat(f_open_s), splat(f_ext_s));
+            let prof = &s.profile[s.slot[c as usize] * segs * L..][..segs * L];
+            let top_prev = clamp(if col == 1 { 0 } else { gap(col - 1) } - off[0]);
+
+            // Pass 1: each lane's own vertical-gap chain, from M and Iy only (F + open
+            // never beats F + extend, so H + open = max(M, Iy) + open).
+            let mut v_f = neg.with_first(clamp(gap(col) + f_open_s - off[0]));
+            let mut v_h = s.h_prev[segs - 1].shift_in(top_prev).add(v_shift);
+            for t in 0..segs {
+                let vm = v_h.add(V::widen(&prof[t * L..]));
+                s.m_local[t] = vm;
+                let ht = vm.max(s.e[t]);
+                s.f_local[t] = v_f;
+                v_f = v_f.add(f_ext).max(ht.add(f_open));
+                v_h = s.h_prev[t];
+            }
+            // Scan across lanes: the Ix value entering each lane from the one above.
+            let exits = v_f.to_array();
+            let lane_decay = f_ext_s * segs as i32;
+            let mut entering = [V::NEG; L];
+            // in the frame of the lane being entered; starts as minus infinity
+            let mut carried = i32::MIN / 4;
+            for lane in 1..L {
+                carried = exits[lane - 1].into().max(carried.saturating_add(lane_decay)) + shift[lane];
+                entering[lane] = clamp(carried);
+            }
+
+            // Pass 2: exact states, H, the next column's Iy, and the trace.
+            let out = &mut trace[j * col_bytes..][..col_bytes];
+            let mut v_in = V::from_array(entering);
+            let (mut up_m, mut up_f) = (neg, neg);
+            let (mut first_f, mut first_packed) = (neg, splat(0));
+            for t in 0..segs {
+                let vm = s.m_local[t];
+                let ve = s.e[t];
+                let f = s.f_local[t].max(v_in);
+                let h = vm.max(ve).max(f);
+                s.h_cur[t] = h;
+                if TRACK {
+                    v_min = v_min.min(h);
+                    v_max = v_max.max(h);
+                }
+                let (eo, ee) = if t == last_seg { (last_open, last_ext) } else { (v_open, v_ext) };
+                let h_open = h.add(eo);
+                let e_next = ve.add(ee).max(h_open);
+                s.e[t] = e_next;
+                let best = flags(best_bits, vm.eq(h), f.eq(h));
+                // The next Iy opens from M (or Ix) exactly when opening wins and M (or Ix)
+                // is this cell's maximum: the best flags, moved up, masked.
+                let iy_next = best.shl4().and(h_open.eq(e_next));
+                if scalar_ends && t == last_seg {
+                    let at = |v: V| v.to_array()[last_lane].into() + off[last_lane];
+                    s.last_row.push((at(vm), at(f)));
+                }
+                if t == 0 {
+                    // its Ix predecessors are only known after the last segment
+                    first_f = f;
+                    first_packed = best.or(iy_next);
+                } else {
+                    let ix = flags(ix_bits, up_m.add(f_open).eq(f), up_f.add(f_ext).eq(f));
+                    best.or(ix).or(iy_next).narrow(&mut out[t * L..]);
+                }
+                (up_m, up_f) = (vm, f);
+                v_in = v_in.add(f_ext);
+            }
+            // Ix predecessors of the first segment come from the last segment of the lane
+            // above (or the empty row 0 for the first lane).
+            let ix0 = flags(
+                ix_bits,
+                up_m.shift_in(V::NEG).add(v_shift).add(f_open).eq(first_f),
+                up_f.shift_in(V::NEG).add(v_shift).add(f_ext).eq(first_f),
+            );
+            first_packed.or(ix0).narrow(out);
+            std::mem::swap(&mut s.h_prev, &mut s.h_cur);
+        }
+        if scalar_ends {
+            let ends = ScalarEnds { m, n, segs, lanes: L, col_bytes, end_open, end_ext };
+            s.last_h.clear();
+            s.last_h.resize(m + 1, 0);
+            s.last_iy.clear();
+            s.last_iy.resize(m + 1, 0);
+            for t in 0..segs {
+                let (h, e) = (s.h_prev[t].to_array(), s.e[t].to_array());
+                for lane in 0..L {
+                    let row = lane * segs + t + 1;
+                    if row <= m {
+                        s.last_h[row] = h[lane].into() + off[lane];
+                        s.last_iy[row] = e[lane].into() + off[lane];
+                    }
+                }
+            }
+            ends.fill(enc, scoring, &s.last_row, &s.last_h, &mut s.last_iy, trace);
+        }
+        // Every stored score must stay exact after one lane shift.
+        let limit = limit - max_shift;
+        let (lo, hi) = (v_min.to_array(), v_max.to_array());
+        !(lo.iter().any(|&v| v.into() < -limit) || hi.iter().any(|&v| v.into() > limit))
+    }
+
+    /// 16-bit fill; `false` if the scores did not fit.
+    pub(super) fn fill_i16(buf: &mut TraceBuffers, scoring: &Scoring, frame: Frame) -> bool {
+        match frame {
+            // `frame_i16` only centres scores whose whole range fits.
+            Frame::Centred(_) => fill::<16, I16x16, false>(buf, scoring, frame, 30_000),
+            Frame::PerLane => fill::<16, I16x16, true>(buf, scoring, frame, 30_000),
+        }
+    }
+
+    pub(super) fn fill_i32(buf: &mut TraceBuffers, scoring: &Scoring) {
+        let exact = fill::<8, I32x8, true>(buf, scoring, Frame::Centred(0), i32::MAX / 8);
+        assert!(exact, "32-bit alignment scores overflowed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::scoring::{GapKind, MatrixKind, Substitution};
@@ -664,11 +989,21 @@ mod tests {
         out
     }
 
+    /// This machine's 16-bit vector fill, or `None` without one.
+    #[allow(unreachable_code, unused_variables, reason = "which paths exist depends on the target")]
+    fn simd_fill_i16(buf: &mut TraceBuffers, s: &Scoring, frame: Frame) -> Option<bool> {
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 support was checked just above.
+            return Some(unsafe { avx2::fill_i16(buf, s, frame) });
+        }
+        #[cfg(target_arch = "aarch64")]
+        return Some(neon::fill_i16(buf, s, frame));
+        None
+    }
+
     #[test]
     fn per_lane_frames_keep_long_alignments_in_16_bit_lanes() {
-        if !is_x86_feature_detected!("avx2") {
-            return;
-        }
         let s = Scoring::new(Substitution::matrix(b'C', MatrixKind::Msa), GapKind::Msa, true);
         let letters = b"CCCCCCADEFAC";
         let mut seed = 5;
@@ -687,8 +1022,7 @@ mod tests {
                     continue;
                 }
                 per_lane += 1;
-                // SAFETY: AVX2 support was checked above.
-                let held = unsafe { avx2::fill_i16(&mut buf, &s, Frame::PerLane) };
+                let Some(held) = simd_fill_i16(&mut buf, &s, Frame::PerLane) else { return };
                 assert!(held, "lens {},{}: 16-bit lanes overflowed", a.len(), b.len());
                 let got = traceback(&a, &b, &buf.trace[buf.trace_start..], a.len().div_ceil(16), 16);
                 let want = gotoh::align(&a, &b, &s, &mut gotoh::AlignBuffers::default());
@@ -701,17 +1035,14 @@ mod tests {
 
     #[test]
     fn per_lane_frames_fall_back_when_a_lane_spreads_too_far() {
-        if !is_x86_feature_detected!("avx2") {
-            return;
-        }
         // 3,750 rows per lane falling 4 per row below the diagonal: lanes end up 15,000
         // apart, which a lane shift cannot carry in 16 bits.
         let s = Scoring::new(Substitution::matrix(b'C', MatrixKind::Msa), GapKind::Msa, true);
         let (a, b) = (vec![b'D'; 60_000], vec![b'D'; 300]);
         let mut buf = TraceBuffers::default();
         buf.enc.encode(&a, &b, &s.sub);
-        // SAFETY: AVX2 support was checked above.
-        assert!(!unsafe { avx2::fill_i16(&mut buf, &s, Frame::PerLane) });
+        let Some(held) = simd_fill_i16(&mut buf, &s, Frame::PerLane) else { return };
+        assert!(!held);
         let want = gotoh::align(&a, &b, &s, &mut gotoh::AlignBuffers::default());
         assert!(align(&a, &b, &s, &mut buf) == want, "32-bit fallback differs from the reference");
     }

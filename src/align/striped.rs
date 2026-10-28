@@ -1,4 +1,4 @@
-//! Score-only global alignment with Farrar's striped SIMD layout (AVX2).
+//! Score-only global alignment with Farrar's striped SIMD layout (AVX2 or NEON).
 //!
 //! Computes exactly the score of [`super::gotoh::score`]: the recurrences are the same
 //! affine-gap model expressed as H/E/F, and trailing-gap-free scoring takes the best cell
@@ -16,6 +16,8 @@ pub struct ScoreBuffers {
     pub(super) alphabet: usize,
     #[cfg(target_arch = "x86_64")]
     simd: avx2::Buffers,
+    #[cfg(target_arch = "aarch64")]
+    simd: neon::Buffers,
 }
 
 impl ScoreBuffers {
@@ -63,6 +65,20 @@ pub fn score(a: &[u8], b: &[u8], scoring: &Scoring, buf: &mut ScoreBuffers) -> i
         return gotoh::score(a, b, scoring);
     }
     debug_assert!(scoring.open <= scoring.extend, "lazy-F loop assumes open <= extend");
+    #[cfg(target_arch = "aarch64")]
+    {
+        buf.encode(a, b, &scoring.sub);
+        let (lo, hi) = score_range(a.len(), b.len(), scoring, &buf.table);
+        // As for AVX2 below.
+        let bias16 = (hi - lo < 64_000).then(|| -(lo + hi) / 2);
+        use crate::neon::{I16x16, I32x8};
+        return match (scoring.open == scoring.extend, bias16) {
+            (true, Some(bias)) => neon::score_linear::<16, I16x16>(buf, scoring, bias),
+            (true, None) => neon::score_linear::<8, I32x8>(buf, scoring, 0),
+            (false, Some(bias)) => neon::score_affine::<16, I16x16>(buf, scoring, bias),
+            (false, None) => neon::score_affine::<8, I32x8>(buf, scoring, 0),
+        };
+    }
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") {
         buf.encode(a, b, &scoring.sub);
@@ -79,6 +95,7 @@ pub fn score(a: &[u8], b: &[u8], scoring: &Scoring, buf: &mut ScoreBuffers) -> i
             }
         };
     }
+    #[allow(unreachable_code, reason = "aarch64 always returns above")]
     gotoh::score(a, b, scoring)
 }
 
@@ -396,6 +413,251 @@ mod avx2 {
         4,
         _mm256_insert_epi32
     );
+}
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    //! The AVX2 kernels' algorithms, generic over the lane width rather than expanded from
+    //! macros: NEON needs no `target_feature`, so generic code inlines fully.
+
+    use super::{ScoreBuffers, Scoring};
+    use crate::neon::{I16x16, I32x8, Lanes};
+
+    /// The vectors of one lane width.
+    #[derive(Debug)]
+    pub(super) struct Vecs<V> {
+        profile: Vec<V>,
+        slot: Vec<usize>,
+        h_prev: Vec<V>,
+        h_cur: Vec<V>,
+        e: Vec<V>,
+    }
+
+    impl<V> Default for Vecs<V> {
+        fn default() -> Self {
+            Self { profile: Vec::new(), slot: Vec::new(), h_prev: Vec::new(), h_cur: Vec::new(), e: Vec::new() }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    pub(super) struct Buffers {
+        w16: Vecs<I16x16>,
+        w32: Vecs<I32x8>,
+    }
+
+    /// A lane width, with its buffers.
+    pub(super) trait Width<const L: usize>: Lanes<L> {
+        fn vecs(buf: &mut Buffers) -> &mut Vecs<Self>;
+    }
+
+    impl Width<16> for I16x16 {
+        fn vecs(buf: &mut Buffers) -> &mut Vecs<Self> {
+            &mut buf.w16
+        }
+    }
+
+    impl Width<8> for I32x8 {
+        fn vecs(buf: &mut Buffers) -> &mut Vecs<Self> {
+            &mut buf.w32
+        }
+    }
+
+    /// Splits `buf` into its encoded sequences and the vectors of lane width `V`.
+    fn split<const L: usize, V: Width<L>>(buf: &mut ScoreBuffers) -> (Encoded<'_>, &mut Vecs<V>) {
+        let enc = Encoded { a: &buf.codes_a, b: &buf.codes_b, table: &buf.table, k: buf.alphabet };
+        (enc, V::vecs(&mut buf.simd))
+    }
+
+    /// Letter codes and the letter-pair score table.
+    #[derive(Clone, Copy)]
+    struct Encoded<'a> {
+        a: &'a [u8],
+        b: &'a [u8],
+        table: &'a [i32],
+        k: usize,
+    }
+
+    impl<V> Vecs<V> {
+        /// Query profile, built only for letters that occur in `b`.
+        fn build_profile<const L: usize>(&mut self, enc: Encoded<'_>, segs: usize)
+        where
+            V: Lanes<L>,
+        {
+            let m = enc.a.len();
+            self.slot.clear();
+            self.slot.resize(enc.k, usize::MAX);
+            self.profile.clear();
+            for &c in enc.b {
+                let c = c as usize;
+                if self.slot[c] != usize::MAX {
+                    continue;
+                }
+                self.slot[c] = self.profile.len() / segs;
+                for t in 0..segs {
+                    self.profile.push(V::from_array(std::array::from_fn(|lane| {
+                        let row = lane * segs + t;
+                        V::cast(if row < m { enc.table[enc.a[row] as usize * enc.k + c] } else { 0 })
+                    })));
+                }
+            }
+        }
+
+        /// The score from the last column (in `h_prev` after the final swap), given the
+        /// best last-row value seen when trailing gaps are free.
+        fn finish<const L: usize>(
+            &self,
+            scoring: &Scoring,
+            (m, n): (usize, usize),
+            bias: i32,
+            best_last_row: i32,
+        ) -> i32
+        where
+            V: Lanes<L>,
+        {
+            let segs = m.div_ceil(L);
+            let (last_seg, last_lane) = ((m - 1) % segs, (m - 1) / segs);
+            if !scoring.free_right_gaps {
+                return self.h_prev[last_seg].to_array()[last_lane].into() - bias;
+            }
+            let mut best = best_last_row.max(scoring.left_gap(n)).max(scoring.left_gap(m));
+            for t in 0..segs {
+                for (lane, &v) in self.h_prev[t].to_array().iter().enumerate() {
+                    if lane * segs + t < m {
+                        best = best.max(v.into() - bias);
+                    }
+                }
+            }
+            best
+        }
+    }
+
+    /// `v + bias`, clamped to the lane range.
+    fn clamp<const L: usize, V: Lanes<L>>(v: i32, bias: i32) -> V::Elem {
+        V::cast((v + bias).clamp(V::NEG.into(), V::MAX.into()))
+    }
+
+    /// Affine gap costs. `bias` is added to every stored score so the range fits the lanes
+    /// and subtracted again from the result.
+    pub(super) fn score_affine<const L: usize, V: Width<L>>(
+        buf: &mut ScoreBuffers,
+        scoring: &Scoring,
+        bias: i32,
+    ) -> i32 {
+        let (enc, simd) = split::<L, V>(buf);
+        let (m, n) = (enc.a.len(), enc.b.len());
+        let segs = m.div_ceil(L);
+        let clamp = |v: i32| clamp::<L, V>(v, bias);
+        let gap = |len: usize| scoring.left_gap(len);
+        simd.build_profile::<L>(enc, segs);
+        let lane_rows = |t: usize| -> [usize; L] { std::array::from_fn(|lane| lane * segs + t + 1) };
+        simd.h_prev.clear();
+        simd.e.clear();
+        for t in 0..segs {
+            let rows = lane_rows(t);
+            simd.h_prev.push(V::from_array(rows.map(|r| clamp(gap(r)))));
+            simd.e.push(V::from_array(rows.map(|r| clamp(gap(r) + scoring.open))));
+        }
+        simd.h_cur.clear();
+        simd.h_cur.resize(segs, V::splat(V::NEG));
+
+        let v_open = V::splat(V::cast(scoring.open));
+        let v_ext = V::splat(V::cast(scoring.extend));
+        let (last_seg, last_lane) = ((m - 1) % segs, (m - 1) / segs);
+        let mut best_last_row = i32::MIN;
+        for (j, &c) in enc.b.iter().enumerate() {
+            let col = j + 1;
+            let prof = &simd.profile[simd.slot[c as usize] * segs..][..segs];
+            let top_prev = if col == 1 { 0 } else { gap(col - 1) };
+            let mut v_f = V::splat(V::NEG).with_first(clamp(gap(col) + scoring.open));
+            let mut v_h = simd.h_prev[segs - 1].shift_in(clamp(top_prev));
+            for (t, &p) in prof.iter().enumerate() {
+                v_h = v_h.add(p).max(simd.e[t]).max(v_f);
+                simd.h_cur[t] = v_h;
+                let v_h_open = v_h.add(v_open);
+                simd.e[t] = simd.e[t].add(v_ext).max(v_h_open);
+                v_f = v_f.add(v_ext).max(v_h_open);
+                v_h = simd.h_prev[t];
+            }
+            // Lazy F: carry vertical gaps across lane boundaries until they stop mattering.
+            v_f = v_f.shift_in(V::NEG);
+            'lazy: for _ in 0..L {
+                for t in 0..segs {
+                    let h = simd.h_cur[t];
+                    if !v_f.add(v_ext).gt(h.add(v_open)).any() {
+                        break 'lazy;
+                    }
+                    let h = h.max(v_f);
+                    simd.h_cur[t] = h;
+                    simd.e[t] = simd.e[t].max(h.add(v_open));
+                    v_f = v_f.add(v_ext);
+                }
+                v_f = v_f.shift_in(V::NEG);
+            }
+            if scoring.free_right_gaps {
+                best_last_row = best_last_row.max(simd.h_cur[last_seg].to_array()[last_lane].into() - bias);
+            }
+            std::mem::swap(&mut simd.h_prev, &mut simd.h_cur);
+        }
+        simd.finish::<L>(scoring, (m, n), bias, best_last_row)
+    }
+
+    /// Linear gap costs (`open == extend`): a horizontal gap into a cell is just its left
+    /// neighbour plus `g` and no gap state is stored.
+    pub(super) fn score_linear<const L: usize, V: Width<L>>(
+        buf: &mut ScoreBuffers,
+        scoring: &Scoring,
+        bias: i32,
+    ) -> i32 {
+        let (enc, simd) = split::<L, V>(buf);
+        let (m, n) = (enc.a.len(), enc.b.len());
+        let segs = m.div_ceil(L);
+        let clamp = |v: i32| clamp::<L, V>(v, bias);
+        let gap = |len: usize| scoring.left_gap(len);
+        simd.build_profile::<L>(enc, segs);
+        simd.h_prev.clear();
+        for t in 0..segs {
+            simd.h_prev.push(V::from_array(std::array::from_fn(|lane| clamp(gap(lane * segs + t + 1)))));
+        }
+        simd.h_cur.clear();
+        simd.h_cur.resize(segs, V::splat(V::NEG));
+
+        let g = scoring.extend;
+        let v_g = V::splat(V::cast(g));
+        let (last_seg, last_lane) = ((m - 1) % segs, (m - 1) / segs);
+        let mut best_last_row = i32::MIN;
+        for (j, &c) in enc.b.iter().enumerate() {
+            let col = j + 1;
+            let prof = &simd.profile[simd.slot[c as usize] * segs..][..segs];
+            let top_prev = if col == 1 { 0 } else { gap(col - 1) };
+            let mut v_f = V::splat(V::NEG).with_first(clamp(gap(col) + g));
+            let mut v_diag = simd.h_prev[segs - 1].shift_in(clamp(top_prev));
+            for (t, &p) in prof.iter().enumerate() {
+                let left = simd.h_prev[t];
+                let h = v_diag.add(p).max(left.add(v_g)).max(v_f);
+                simd.h_cur[t] = h;
+                v_f = h.add(v_g);
+                v_diag = left;
+            }
+            // Lazy F: carry vertical gaps across lane boundaries until they stop mattering.
+            v_f = v_f.shift_in(V::NEG);
+            'lazy: for _ in 0..L {
+                for t in 0..segs {
+                    let h = simd.h_cur[t];
+                    if !v_f.gt(h).any() {
+                        break 'lazy;
+                    }
+                    simd.h_cur[t] = h.max(v_f);
+                    v_f = v_f.add(v_g);
+                }
+                v_f = v_f.shift_in(V::NEG);
+            }
+            if scoring.free_right_gaps {
+                best_last_row = best_last_row.max(simd.h_cur[last_seg].to_array()[last_lane].into() - bias);
+            }
+            std::mem::swap(&mut simd.h_prev, &mut simd.h_cur);
+        }
+        simd.finish::<L>(scoring, (m, n), bias, best_last_row)
+    }
 }
 
 #[cfg(test)]

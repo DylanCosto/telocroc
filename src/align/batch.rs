@@ -1,11 +1,11 @@
-//! Score-only global alignment of up to 32 independent pairs at once (AVX2), one pair per
-//! 8-bit lane.
+//! Score-only global alignment of up to 32 independent pairs at once (AVX2 or NEON), one
+//! pair per 8-bit lane.
 //!
 //! Substitution scores must have the form `x == y ? same[x] : other[x] + other[y]`, as the
 //! TVR matrix and match/mismatch scoring do. Subtracting `other` of every letter consumed
 //! so far, `H'(i, j) = H(i, j) - sum(other[a[..i]]) - sum(other[b[..j]])`, turns a mismatch
 //! into a step of 0, a match into `same[x] - 2 other[x]`, and each gap into `g - other` of
-//! the letter it skips; the per-letter values are looked up with `pshufb`.
+//! the letter it skips; the per-letter values are looked up with `pshufb` (`tbl` on NEON).
 //!
 //! Lanes hold *differences* of `H'` between neighbouring cells rather than scores (the
 //! difference recurrence of Suzuki and Kasahara). With linear gaps every difference is
@@ -41,13 +41,13 @@ pub struct BatchScorer {
 impl BatchScorer {
     /// Returns `None` when batched scoring cannot reproduce `scoring` exactly: affine or
     /// free trailing gaps, a substitution table that does not decompose, or scores too
-    /// large for 8-bit differences. Also `None` without AVX2.
+    /// large for 8-bit differences. Also `None` without AVX2 or NEON.
     pub fn new(scoring: &Scoring) -> Option<Self> {
         #[cfg(target_arch = "x86_64")]
         if !is_x86_feature_detected!("avx2") {
             return None;
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         return None;
         if scoring.open != scoring.extend || scoring.free_right_gaps || !(-32..0).contains(&scoring.open) {
             return None;
@@ -86,7 +86,8 @@ impl BatchScorer {
             }
         }
         let class_bits = classes.len().next_power_of_two().trailing_zeros();
-        // Codes must stay below 128 so pshufb reads the class from the low bits.
+        // Codes must stay below 128 so pshufb reads the class from the low bits (tbl reads
+        // the masked class).
         if classes.len() > 16 || letters.len() > 1 << (7 - class_bits) {
             return None;
         }
@@ -159,7 +160,18 @@ impl BatchScorer {
         unsafe {
             avx2::fill(self, pairs, buf, out);
         }
+        #[cfg(target_arch = "aarch64")]
+        neon::fill(self, pairs, buf, out);
     }
+}
+
+/// Whether this machine has a batched kernel (AVX2 or NEON).
+#[cfg(test)]
+pub(super) fn has_kernel() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    cfg!(target_arch = "aarch64")
 }
 
 /// Reusable per-thread buffers for [`BatchScorer::score`].
@@ -174,6 +186,8 @@ pub struct BatchBuffers {
     /// Vertical differences of the current column, one row per entry.
     #[cfg(target_arch = "x86_64")]
     v: Vec<std::arch::x86_64::__m256i>,
+    #[cfg(target_arch = "aarch64")]
+    v: Vec<crate::neon::I8x32>,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -338,6 +352,147 @@ mod avx2 {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use std::arch::aarch64::*;
+
+    use super::{BatchBuffers, BatchScorer, LANES};
+    use crate::neon::{I8x32, neon};
+
+    /// Lookup tables and the class mask, as in the AVX2 kernel.
+    struct Cells {
+        bonus: int8x16_t,
+        step: int8x16_t,
+        mask: I8x32,
+    }
+
+    /// A row's letter codes with their match and gap steps.
+    type Row = (I8x32, I8x32, I8x32);
+    /// A column's letter codes with their gap steps.
+    type Col = (I8x32, I8x32);
+
+    impl Cells {
+        #[inline]
+        fn row(&self, codes: &[u8; LANES]) -> Row {
+            let x = I8x32::load(codes);
+            let class = x.and(self.mask);
+            (x, class.lookup(self.bonus), class.lookup(self.step))
+        }
+
+        #[inline]
+        fn col(&self, codes: &[u8; LANES]) -> Col {
+            let (y, _, step_y) = self.row(codes);
+            (y, step_y)
+        }
+
+        /// One cell from the vertical difference to its left (`left`, previous column)
+        /// and the horizontal difference above it (`up`, previous row). Returns the
+        /// cell's vertical and horizontal differences.
+        #[inline]
+        fn step(&self, (x, bonus_x, step_x): Row, (y, step_y): Col, left: I8x32, up: I8x32) -> (I8x32, I8x32) {
+            // A gap from the left skips b[j] and one from above skips a[i].
+            let diag = x.eq(y).and(bonus_x);
+            let gaps = left.add(step_y).max(up.add(step_x));
+            let z = diag.max(gaps);
+            (z.sub(up), z.sub(left))
+        }
+    }
+
+    /// Columns per pass over the rows (at most 4).
+    const COLUMNS: usize = 4;
+
+    /// Advances `v` across the `K` columns `cols`.
+    #[inline]
+    fn pass<const K: usize>(cells: &Cells, a: &[[u8; LANES]], cols: &[[u8; LANES]], v: &mut [I8x32]) {
+        let ys: [Col; K] = std::array::from_fn(|c| cells.col(&cols[c]));
+        // Top border: H'(0, j) - H'(0, j - 1) is the gap step of b[j].
+        let mut ups: [I8x32; K] = std::array::from_fn(|c| ys[c].1);
+        for (cell, codes) in v.iter_mut().zip(a) {
+            let x = cells.row(codes);
+            let mut left = *cell;
+            for c in 0..K {
+                (left, ups[c]) = cells.step(x, ys[c], left, ups[c]);
+            }
+            *cell = left;
+        }
+    }
+
+    /// Per lane, the sum of `v[..m]` where `m` is the lane's `a` length, for the lanes in
+    /// `ending` (other lanes' entries are unspecified).
+    fn column_sums(v: &[I8x32], pairs: &[(&[u8], &[u8])], ending: u32) -> [i32; LANES] {
+        let mut sums = [0i32; LANES];
+        let mut lens = (0..pairs.len()).filter(|&l| ending & (1 << l) != 0).map(|l| pairs[l].0.len());
+        let first = lens.next().unwrap_or(0);
+        if lens.all(|m| m == first) {
+            // One row count for every lane: widen and add whole rows, four lanes per
+            // accumulator in lane order.
+            let mut acc = [neon!(vdupq_n_s32(0)); 8];
+            for &d in &v[..first] {
+                for (h, half) in d.halves().into_iter().enumerate() {
+                    let acc = &mut acc[4 * h..4 * h + 4];
+                    neon!({
+                        let (lo, hi) = (vmovl_s8(vget_low_s8(half)), vmovl_high_s8(half));
+                        acc[0] = vaddw_s16(acc[0], vget_low_s16(lo));
+                        acc[1] = vaddw_high_s16(acc[1], lo);
+                        acc[2] = vaddw_s16(acc[2], vget_low_s16(hi));
+                        acc[3] = vaddw_high_s16(acc[3], hi);
+                    });
+                }
+            }
+            for (k, a) in acc.into_iter().enumerate() {
+                // SAFETY: `sums[4k..4k + 4]` is 4 writable i32s; the store is unaligned.
+                unsafe { vst1q_s32(sums[4 * k..4 * k + 4].as_mut_ptr(), a) };
+            }
+            return sums;
+        }
+        let mut rest = ending;
+        while rest != 0 {
+            let lane = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            sums[lane] = v[..pairs[lane].0.len()].iter().map(|&d| i32::from(d.to_array()[lane])).sum();
+        }
+        sums
+    }
+
+    /// Completes `out` (pre-filled with each lane's border terms) for every pair.
+    pub(super) fn fill(scorer: &BatchScorer, pairs: &[(&[u8], &[u8])], buf: &mut BatchBuffers, out: &mut [i32]) {
+        // SAFETY: 16 readable bytes.
+        let table = |t: &[i8; 16]| unsafe { vld1q_s8(t.as_ptr()) };
+        let cells = Cells {
+            bonus: table(&scorer.bonus),
+            step: table(&scorer.step),
+            mask: I8x32::splat(scorer.class_mask as i8),
+        };
+        let (a, b) = (&buf.a, &buf.b);
+        // Left border: H'(i, 0) - H'(i - 1, 0) is the gap step of a[i].
+        buf.v.clear();
+        buf.v.extend(a.iter().map(|codes| cells.row(codes).2));
+        let v = &mut buf.v[..];
+        let mut j = 0;
+        while j < b.len() {
+            // Several columns per pass over the rows; a pass ends at any column where a
+            // lane ends, so its differences are still in `v` when that lane is summed.
+            let span = (1..=COLUMNS).take_while(|&k| j + k <= b.len() && (k == 1 || buf.ends[j + k - 2] == 0)).last();
+            match span.unwrap_or(1) {
+                4 => pass::<4>(&cells, a, &b[j..j + 4], v),
+                3 => pass::<3>(&cells, a, &b[j..j + 3], v),
+                2 => pass::<2>(&cells, a, &b[j..j + 2], v),
+                _ => pass::<1>(&cells, a, &b[j..j + 1], v),
+            }
+            j += span.unwrap_or(1);
+            // As in the AVX2 kernel: g n + sum(other[a]) + the differences down column n.
+            let ending = buf.ends[j - 1];
+            if ending != 0 {
+                for (lane, down) in column_sums(v, pairs, ending).into_iter().enumerate() {
+                    if ending & (1 << lane) != 0 {
+                        out[lane] += down;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::gotoh;
@@ -368,7 +523,10 @@ mod tests {
         use super::super::striped::{self, ScoreBuffers};
         use rayon::prelude::*;
         let scoring = Scoring::new(Substitution::matrix(b'C', MatrixKind::Tvr), GapKind::Tvr, false);
-        let scorer = BatchScorer::new(&scoring).expect("TVR scoring decomposes");
+        let Some(scorer) = BatchScorer::new(&scoring) else {
+            assert!(!has_kernel(), "TVR scoring decomposes");
+            return;
+        };
         let mut seed = 1;
         let letters = b"CCCCCCCCCCCCCCCCCCCCCCDEFAAAGHC";
         let seqs: Vec<Vec<u8>> = (0..64).map(|_| random_seq(&mut seed, 1000, letters)).collect();
@@ -410,7 +568,7 @@ mod tests {
     fn accepts_the_distance_schemes_and_rejects_the_rest() {
         let tvr = Scoring::new(Substitution::matrix(b'C', MatrixKind::Tvr), GapKind::Tvr, false);
         let mm = Scoring::new(Substitution::MatchMismatch, GapKind::Tvr, false);
-        assert!(BatchScorer::new(&tvr).is_some());
+        assert_eq!(BatchScorer::new(&tvr).is_some(), has_kernel());
         assert!(BatchScorer::new(&mm).is_none(), "256 byte letters do not fit 7-bit codes");
         assert!(
             BatchScorer::new(&Scoring::new(Substitution::matrix(b'C', MatrixKind::Tvr), GapKind::Tvr, true)).is_none()
@@ -423,7 +581,10 @@ mod tests {
     #[test]
     fn batches_match_the_reference() {
         let scoring = Scoring::new(Substitution::matrix(b'C', MatrixKind::Tvr), GapKind::Tvr, false);
-        let scorer = BatchScorer::new(&scoring).expect("TVR scoring decomposes");
+        let Some(scorer) = BatchScorer::new(&scoring) else {
+            assert!(!has_kernel(), "TVR scoring decomposes");
+            return;
+        };
         let mut seed = 11;
         for trial in 0..60 {
             let letters: &[u8] = if trial % 2 == 0 { b"CCCCCCCCCCCCCADEFGHC" } else { b"ACDEFGHIKLMNPQRSTVWY-" };
@@ -446,7 +607,10 @@ mod tests {
     #[test]
     fn long_pairs_and_extreme_scores_match_the_reference() {
         let scoring = Scoring::new(Substitution::matrix(b'C', MatrixKind::Tvr), GapKind::Tvr, false);
-        let scorer = BatchScorer::new(&scoring).expect("TVR scoring decomposes");
+        let Some(scorer) = BatchScorer::new(&scoring) else {
+            assert!(!has_kernel(), "TVR scoring decomposes");
+            return;
+        };
         let mut seed = 5;
         let pairs = vec![
             (vec![b'D'; 12000], vec![b'D'; 12000]),

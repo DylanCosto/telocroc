@@ -3,8 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-use rust_htslib::bam::{self, Read as _};
+use anyhow::{Result, bail};
 
 use crate::cli::ReadType;
 use crate::kmers::KmerTable;
@@ -101,14 +100,4 @@ pub fn random_seed() -> u64 {
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
     1 + h.finish() % 99_999_999
-}
-
-/// Reference sequence names from a BAM header, by target id.
-///
-/// # Errors
-///
-/// Fails if the file cannot be opened.
-pub fn reference_names(bam_path: &Path) -> Result<Vec<String>> {
-    let reader = bam::Reader::from_path(bam_path).with_context(|| format!("opening {}", bam_path.display()))?;
-    Ok(reader.header().target_names().iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect())
 }

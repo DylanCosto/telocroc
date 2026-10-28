@@ -2,6 +2,7 @@
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::thread;
@@ -9,7 +10,10 @@ use std::thread;
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use flate2::read::MultiGzDecoder;
-use rust_htslib::bam::{self, Read as _, record::Aux};
+use noodles::sam::alignment::Record as _;
+use noodles::sam::alignment::record::Data;
+use noodles::sam::alignment::record::data::field::{Tag, Value, value::Array};
+use noodles::{bam, bgzf, cram, fasta, sam};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputKind {
@@ -327,27 +331,78 @@ impl Drop for Igzip {
     }
 }
 
-/// Opens a BAM or CRAM file for streaming with `threads` decompression threads.
+/// A BAM reader inflating BGZF blocks on a thread pool of its own.
+pub type BamReader = bam::io::Reader<bgzf::io::MultithreadedReader<File>>;
+
+/// Opens a BAM file, past its header, for streaming with `threads` decompression threads.
 ///
 /// # Errors
 ///
-/// Fails if the file cannot be opened or the CRAM reference cannot be set.
-pub fn open_alignments(path: &Path, threads: usize, cram_ref: Option<&Path>) -> Result<bam::Reader> {
-    let mut reader = bam::Reader::from_path(path).with_context(|| format!("opening {}", path.display()))?;
-    if threads > 1 {
-        reader.set_threads(threads).context("starting decompression threads")?;
-    }
-    if let Some(r) = cram_ref {
-        reader.set_reference(r).with_context(|| format!("setting CRAM reference {}", r.display()))?;
-    }
+/// Fails if the file cannot be opened or its header cannot be read.
+pub fn open_bam(path: &Path, threads: usize) -> Result<BamReader> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let workers = NonZero::new(threads).unwrap_or(NonZero::<usize>::MIN);
+    let mut reader = bam::io::Reader::from(bgzf::io::MultithreadedReader::with_worker_count(workers, file));
+    reader.read_header().with_context(|| format!("reading header of {}", path.display()))?;
     Ok(reader)
 }
 
+/// A CRAM reader of raw containers.
+pub type CramReader = cram::io::Reader<BufReader<File>>;
+
+/// What decoding a CRAM container needs besides the container itself.
+#[derive(Debug)]
+pub struct CramContext {
+    pub header: sam::Header,
+    pub reference: fasta::Repository,
+}
+
+/// Opens a CRAM file, past its header. Containers are read raw, to be decoded elsewhere
+/// with the returned context.
+///
+/// # Errors
+///
+/// Fails if the file, its header or the reference cannot be read.
+pub fn open_cram(path: &Path, cram_ref: Option<&Path>) -> Result<(CramReader, CramContext)> {
+    let reference = match cram_ref {
+        Some(r) => fasta::Repository::new(fasta::repository::adapters::IndexedReader::new(open_indexed_fasta(r)?)),
+        None => fasta::Repository::default(),
+    };
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut reader = cram::io::Reader::new(BufReader::with_capacity(1 << 20, file));
+    let header = reader.read_header().with_context(|| format!("reading header of {}", path.display()))?;
+    Ok((reader, CramContext { header, reference }))
+}
+
+/// Opens an indexed FASTA, writing `<path>.fai` first if it is missing (as htslib does).
+fn open_indexed_fasta(path: &Path) -> Result<fasta::io::IndexedReader<fasta::io::BufReader<File>>> {
+    if !path.with_added_extension("fai").exists() {
+        index_fasta(path)?;
+    }
+    fasta::io::indexed_reader::Builder::default()
+        .build_from_path(path)
+        .with_context(|| format!("opening reference {}", path.display()))
+}
+
+/// Writes `<path>.fai` for an uncompressed FASTA file.
+///
+/// # Errors
+///
+/// Fails if the file cannot be read or the index cannot be written.
+pub fn index_fasta(path: &Path) -> Result<()> {
+    let fai = path.with_added_extension("fai");
+    let index = fasta::fs::index(path).with_context(|| format!("indexing {}", path.display()))?;
+    fasta::fai::fs::write(&fai, &index).with_context(|| format!("writing {}", fai.display()))
+}
+
+/// BAM's 4-bit base codes, by code.
+const NT16: &[u8; 16] = b"=ACMGRSVTWYHKDBN";
+
 /// Decodes a BAM record's sequence into `out` (uppercase IUPAC letters).
 pub fn decode_seq(rec: &bam::Record, out: &mut Vec<u8>) {
-    const NT16: &[u8; 16] = b"=ACMGRSVTWYHKDBN";
-    let len = rec.seq_len();
-    let packed = rec.seq().encoded;
+    let seq = rec.sequence();
+    let len = seq.len();
+    let packed = seq.as_bytes();
     out.clear();
     out.reserve(len);
     for &b in &packed[..len / 2] {
@@ -359,13 +414,46 @@ pub fn decode_seq(rec: &bam::Record, out: &mut Vec<u8>) {
     }
 }
 
+/// Decodes a CRAM record's sequence into `out`, normalized as BAM's 4-bit packing would
+/// (uppercase IUPAC letters, anything else `N`).
+pub fn decode_cram_seq(rec: &cram::Record<'_>, out: &mut Vec<u8>) {
+    out.clear();
+    out.extend(rec.sequence().iter().map(|b| NT16_NORMALIZED[usize::from(b)]));
+}
+
+/// Each byte's letter after a round trip through BAM's 4-bit code (htslib's
+/// `seq_nt16_table`, then [`NT16`]).
+const NT16_NORMALIZED: [u8; 256] = {
+    let mut table = [b'N'; 256];
+    let mut code = 0;
+    while code < NT16.len() {
+        let letter = NT16[code];
+        table[letter as usize] = letter;
+        table[letter.to_ascii_lowercase() as usize] = letter;
+        code += 1;
+    }
+    table[b'U' as usize] = b'T';
+    table[b'u' as usize] = b'T';
+    table
+};
+
+/// A record's name as htslib gives it (`*` when there is none).
+pub fn record_name(rec: &impl sam::alignment::Record) -> String {
+    rec.name().map_or_else(|| "*".to_string(), |n| String::from_utf8_lossy(n).into_owned())
+}
+
 /// Whether a record's MM/ML tags carry at least one 5mC or 5hmC call that lands on a
 /// C of the read (Telogator2's `extract_methylation` returning data).
-pub fn has_methylation(rec: &bam::Record, seq: &[u8]) -> bool {
-    let (Ok(Aux::String(mm)), Ok(ml)) = (rec.aux(b"MM"), rec.aux(b"ML")) else {
+pub fn has_methylation<'r>(data: &impl Data<'r>, seq: &[u8]) -> bool {
+    let (Some(Ok(Value::String(mm))), Some(Ok(Value::Array(Array::UInt8(_))))) =
+        (data.get(&Tag::BASE_MODIFICATIONS), data.get(&Tag::BASE_MODIFICATION_PROBABILITIES))
+    else {
         return false;
     };
-    if mm.is_empty() || !matches!(ml, Aux::ArrayU8(_)) {
+    let Ok(mm) = std::str::from_utf8(mm) else {
+        return false;
+    };
+    if mm.is_empty() {
         return false;
     }
     let num_c = seq.iter().filter(|&&b| b == b'C').count();
@@ -463,5 +551,36 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CRAM bases normalize as htslib's 4-bit packing does: case folded, U read as T,
+    /// anything else N.
+    #[test]
+    fn cram_bases_normalize_like_bam_packing() {
+        let cases = [(b'a', b'A'), (b'C', b'C'), (b'=', b'='), (b'u', b'T'), (b'y', b'Y'), (b'x', b'N'), (b'*', b'N')];
+        for (base, want) in cases {
+            assert_eq!(NT16_NORMALIZED[usize::from(base)], want, "base {:?}", char::from(base));
+        }
+    }
+
+    /// A 5mC or 5hmC call counts only if it lands on one of the read's Cs.
+    #[test]
+    fn methylation_needs_a_call_on_a_read_c() {
+        use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
+        use noodles::sam::alignment::record_buf::data::field::value::Array as BufArray;
+
+        let data = |mm: &str| -> sam::alignment::record_buf::Data {
+            let ml = BufValue::Array(BufArray::UInt8(vec![200]));
+            [(Tag::BASE_MODIFICATIONS, BufValue::from(mm)), (Tag::BASE_MODIFICATION_PROBABILITIES, ml)]
+                .into_iter()
+                .collect()
+        };
+        let seq = b"ACGTCC";
+        for (mm, want) in [("C+m?,2;", true), ("C+h,0;", true), ("C+m?,3;", false), ("A+a,0;", false), ("", false)] {
+            assert_eq!(has_methylation(&&data(mm), seq), want, "MM:Z:{mm}");
+        }
+        let no_ml: sam::alignment::record_buf::Data =
+            [(Tag::BASE_MODIFICATIONS, BufValue::from("C+m,0;"))].into_iter().collect();
+        assert!(!has_methylation(&&no_ml, seq), "MM without ML");
     }
 }

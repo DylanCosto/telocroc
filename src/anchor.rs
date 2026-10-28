@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -11,7 +11,11 @@ use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
-use rust_htslib::bam::{self, Read as _, record::Cigar};
+use noodles::sam::alignment::RecordBuf;
+use noodles::sam::alignment::io::Write as _;
+use noodles::sam::alignment::record::cigar::op::Kind;
+use noodles::sam::header::record::value::map::header::{sort_order, tag};
+use noodles::{bam, sam};
 
 use crate::alleles::AlleleRow;
 use crate::cli::ReadType;
@@ -160,13 +164,21 @@ fn write_fasta(w: &mut impl Write, subtels: &[(String, Vec<u8>)]) -> Result<()> 
     Ok(())
 }
 
+/// Subtelomere alignments in coordinate order.
+#[derive(Debug)]
+pub struct SubtelAlignments {
+    /// Reference contig names, indexed by the records' reference sequence IDs.
+    pub ref_names: Vec<String>,
+    pub records: Vec<RecordBuf>,
+}
+
 /// Writes the subtelomere FASTA, runs the aligner (or feeds the one already `started`)
 /// and returns its alignments in coordinate-sorted order (also saved as `subtel_aln.bam`).
 ///
 /// # Errors
 ///
 /// Fails if the aligner cannot be run or produces no alignments file.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "one call site, in the pipeline")]
 pub fn align_subtels(
     subtels: &[(String, Vec<u8>)],
     started: Option<StartedAligner>,
@@ -176,7 +188,7 @@ pub fn align_subtels(
     threads: usize,
     paths: &AnchorPaths,
     temp_dir: &Path,
-) -> Result<Vec<bam::Record>> {
+) -> Result<SubtelAlignments> {
     {
         let file =
             File::create(&paths.unanchored).with_context(|| format!("creating {}", paths.unanchored.display()))?;
@@ -207,20 +219,21 @@ pub fn align_subtels(
     if !status.success() {
         bail!("alignment command returned an error ({status}); see {}", paths.log.display());
     }
-    let records = match aligner {
-        Aligner::Pbmm2(_) => read_records(&paths.bam)?,
+    let (header, records) = match aligner {
+        Aligner::Pbmm2(_) => read_bam(&paths.bam)?,
         _ => {
             if !paths.sam.exists() {
                 bail!("subtel alignment failed. Check the log: {}", paths.log.display());
             }
             let (header, mut records) = read_sam(&paths.sam)?;
             sort_like_samtools(&mut records);
-            write_sorted_bam(&paths.bam, &header, &records)?;
+            let header = write_sorted_bam(&paths.bam, header, &records)?;
             let _ = fs::remove_file(&paths.sam);
-            records
+            (header, records)
         }
     };
-    Ok(records)
+    let ref_names = header.reference_sequences().keys().map(|n| String::from_utf8_lossy(n).into_owned()).collect();
+    Ok(SubtelAlignments { ref_names, records })
 }
 
 fn run_logged(mut cmd: Command, aligner: &Aligner, paths: &AnchorPaths) -> Result<std::process::ExitStatus> {
@@ -232,48 +245,56 @@ fn decompress_reference(gz: &Path, out: &Path) -> Result<()> {
     let mut text = Vec::new();
     MultiGzDecoder::new(File::open(gz).with_context(|| format!("opening {}", gz.display()))?).read_to_end(&mut text)?;
     fs::write(out, &text)?;
-    rust_htslib::faidx::Reader::from_path(out).with_context(|| format!("indexing {}", out.display()))?;
-    Ok(())
+    crate::input::index_fasta(out)
 }
 
-fn read_records(path: &Path) -> Result<Vec<bam::Record>> {
-    let mut reader = bam::Reader::from_path(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut out = Vec::new();
-    for rec in reader.records() {
-        out.push(rec?);
-    }
-    Ok(out)
+fn read_bam(path: &Path) -> Result<(sam::Header, Vec<RecordBuf>)> {
+    let mut reader =
+        bam::io::reader::Builder.build_from_path(path).with_context(|| format!("opening {}", path.display()))?;
+    let header = reader.read_header().with_context(|| format!("reading header of {}", path.display()))?;
+    let records = reader.record_bufs(&header).collect::<std::io::Result<_>>();
+    Ok((header, records.with_context(|| format!("reading {}", path.display()))?))
 }
 
-fn read_sam(path: &Path) -> Result<(bam::Header, Vec<bam::Record>)> {
-    let mut reader = bam::Reader::from_path(path).with_context(|| format!("opening {}", path.display()))?;
-    let header = bam::Header::from_template(reader.header());
-    let mut out = Vec::new();
-    for rec in reader.records() {
-        out.push(rec?);
-    }
-    Ok((header, out))
+fn read_sam(path: &Path) -> Result<(sam::Header, Vec<RecordBuf>)> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut reader = sam::io::Reader::new(BufReader::new(file));
+    let header = reader.read_header().with_context(|| format!("reading header of {}", path.display()))?;
+    let records = reader.record_bufs(&header).collect::<std::io::Result<_>>();
+    Ok((header, records.with_context(|| format!("reading {}", path.display()))?))
 }
 
 /// `samtools sort` coordinate order: reference, position, then strand, keeping input
 /// order for ties; unmapped reads (no reference) go last.
-fn sort_like_samtools(records: &mut [bam::Record]) {
+fn sort_like_samtools(records: &mut [RecordBuf]) {
     records.sort_by_key(|r| {
-        let tid = if r.tid() < 0 { u32::MAX } else { r.tid() as u32 };
-        (tid, r.pos() + 1, r.is_reverse())
+        let tid = r.reference_sequence_id().unwrap_or(usize::MAX);
+        (tid, r.alignment_start().map_or(0, usize::from), r.flags().is_reverse_complemented())
     });
 }
 
-fn write_sorted_bam(path: &Path, header: &bam::Header, records: &[bam::Record]) -> Result<()> {
+/// Writes `records` (already sorted) as a BAM marked `SO:coordinate`, and its BAI index.
+/// Returns the header as written.
+fn write_sorted_bam(path: &Path, mut header: sam::Header, records: &[RecordBuf]) -> Result<sam::Header> {
+    let mut hd = header.header().cloned().unwrap_or_default();
+    hd.other_fields_mut().insert(tag::SORT_ORDER, sort_order::COORDINATE.into());
+    *header.header_mut() = Some(hd);
     {
-        let mut writer = bam::Writer::from_path(path, header, bam::Format::Bam)
-            .with_context(|| format!("creating {}", path.display()))?;
+        let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+        let mut writer = bam::io::Writer::new(file);
+        writer.write_header(&header)?;
         for r in records {
-            writer.write(r)?;
+            writer.write_alignment_record(&header, r)?;
         }
+        writer.try_finish()?;
     }
-    bam::index::build(path, None, bam::index::Type::Bai, 1).with_context(|| format!("indexing {}", path.display()))?;
-    Ok(())
+    // The subtelomere contigs are far shorter than the 2^29 bp a BAI can index.
+    let bam::Index::Bai(index) = bam::fs::index(path).with_context(|| format!("indexing {}", path.display()))? else {
+        bail!("{}: reference too long for a BAI index", path.display());
+    };
+    let bai = path.with_added_extension("bai");
+    bam::bai::fs::write(&bai, &index).with_context(|| format!("writing {}", bai.display()))?;
+    Ok(header)
 }
 
 /// The fields of one alignment Telogator2 keeps (`parse_read`).
@@ -287,10 +308,10 @@ struct Alignment {
     seq_len: i64,
 }
 
-fn parse_alignment(rec: &bam::Record, ref_names: &[String]) -> Alignment {
-    let seq_len = if rec.seq_len() == 0 { 4 } else { rec.seq_len() as i64 };
-    let reference = if rec.tid() >= 0 { ref_names[rec.tid() as usize].clone() } else { "*".to_string() };
-    if reference == "*" || rec.is_unmapped() {
+fn parse_alignment(rec: &RecordBuf, ref_names: &[String]) -> Alignment {
+    let seq_len = if rec.sequence().is_empty() { 4 } else { rec.sequence().len() as i64 };
+    let reference = rec.reference_sequence_id().map_or_else(|| "*".to_string(), |id| ref_names[id].clone());
+    if reference == "*" || rec.flags().is_unmapped() {
         return Alignment {
             read_pos: (0, seq_len),
             reference: "*".to_string(),
@@ -299,44 +320,48 @@ fn parse_alignment(rec: &bam::Record, ref_names: &[String]) -> Alignment {
             seq_len,
         };
     }
-    let cigar = rec.cigar();
-    let ops: Vec<Cigar> = cigar.iter().copied().collect();
-    let is_clip = |c: &Cigar| matches!(c, Cigar::SoftClip(_) | Cigar::HardClip(_));
-    let start_clip = ops.first().filter(|c| is_clip(c)).map_or(0, |c| i64::from(c.len()));
-    let end_clip = if ops.len() > 1 { ops.last().filter(|c| is_clip(c)).map_or(0, |c| i64::from(c.len())) } else { 0 };
+    let ops = rec.cigar().as_ref();
+    let is_clip = |k: Kind| matches!(k, Kind::SoftClip | Kind::HardClip);
+    let start_clip = ops.first().filter(|c| is_clip(c.kind())).map_or(0, |c| c.len() as i64);
+    let end_clip =
+        if ops.len() > 1 { ops.last().filter(|c| is_clip(c.kind())).map_or(0, |c| c.len() as i64) } else { 0 };
     let (mut ref_adj, mut read_adj) = (0i64, 0i64);
-    for c in &ops {
-        let len = i64::from(c.len());
-        match c {
-            Cigar::Match(_) | Cigar::Diff(_) | Cigar::Equal(_) => {
+    for c in ops {
+        let len = c.len() as i64;
+        match c.kind() {
+            Kind::Match | Kind::SequenceMismatch | Kind::SequenceMatch => {
                 ref_adj += len;
                 read_adj += len;
             }
-            Cigar::Del(_) => ref_adj += len,
-            Cigar::Ins(_) => read_adj += len,
+            Kind::Deletion => ref_adj += len,
+            Kind::Insertion => read_adj += len,
             _ => {}
         }
     }
-    let pos = rec.pos();
+    // 0-based, as pysam's reference_start
+    let pos = rec.alignment_start().map_or(-1, |p| usize::from(p) as i64 - 1);
     let mut read_pos = (start_clip, start_clip + read_adj);
     let read_len = start_clip + read_adj + end_clip;
-    let ref_pos = if rec.is_reverse() {
+    let ref_pos = if rec.flags().is_reverse_complemented() {
         read_pos = (read_len - read_pos.1, read_len - read_pos.0);
         (pos + ref_adj, pos)
     } else {
         (pos, pos + ref_adj)
     };
-    Alignment { read_pos, reference, ref_pos, mapq: i64::from(rec.mapq()), seq_len }
+    // 255: mapping quality unavailable
+    let mapq = rec.mapping_quality().map_or(255, |q| i64::from(q.get()));
+    Alignment { read_pos, reference, ref_pos, mapq, seq_len }
 }
 
 /// Fills chromosome, position, reference build and mapping qualities of anchored alleles
 /// (`alleles[k]` is allele `k`, as numbered in the subtelomere read names).
-pub fn assign_anchors(records: &[bam::Record], ref_names: &[String], alleles: &mut [AlleleRow]) {
+pub fn assign_anchors(alignments: &SubtelAlignments, alleles: &mut [AlleleRow]) {
+    let SubtelAlignments { ref_names, records } = alignments;
     // alignments grouped by read name, names in order of first appearance
     let mut order: Vec<String> = Vec::new();
     let mut by_name: HashMap<String, Vec<Alignment>> = HashMap::new();
     for rec in records {
-        let name = String::from_utf8_lossy(rec.qname()).into_owned();
+        let name = crate::input::record_name(rec);
         let aln = parse_alignment(rec, ref_names);
         by_name
             .entry(name.clone())

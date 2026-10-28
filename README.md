@@ -27,7 +27,7 @@ cargo build --release
 scripts/fetch-resources.sh   # subtelomere reference (~70 MB)
 ```
 
-Needs Rust 1.87+ and libclang (for `rust-htslib`). Builds on x86-64 and aarch64 (Apple Silicon,
+Needs Rust 1.91+. Builds on x86-64 and aarch64 (Apple Silicon,
 Graviton): AVX2 is used when available on x86-64, and NEON always on aarch64.
 
 ## Usage

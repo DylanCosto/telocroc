@@ -2,7 +2,7 @@
 name = "telocroc"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.91"
 description = "Fast allele-specific telomere length from long reads"
 license = "MIT"
 repository = "https://github.com/DylanCosto/telocroc"
@@ -21,9 +21,9 @@ crossbeam-channel = "0.5.15"
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 memchr = "2.8.3"
 mimalloc = "0.1.52"
+noodles = { version = "0.118.0", features = ["bam", "bgzf", "cram", "fasta", "sam"] }
 pprof = { version = "0.15.0", features = ["flamegraph"], optional = true }
 rayon = "1.12.0"
-rust-htslib = { version = "1.0.2", default-features = false, features = ["bzip2", "lzma", "libdeflate"] }
 
 [features]
 # Sampling CPU profiler: set TELOCROC_PROFILE=prefix to write prefix.svg (flame graph)

@@ -29,12 +29,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - name: Install htslib build dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libclang-dev zlib1g-dev libbz2-dev liblzma-dev
-      - name: Install htslib build dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: brew install xz
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --release --all-targets -- -D warnings

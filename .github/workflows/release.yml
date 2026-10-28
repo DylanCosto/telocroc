@@ -23,9 +23,8 @@ jobs:
     container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust and libclang
+      - name: Install Rust
         run: |
-          dnf install -y clang-devel
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Check the tag matches Cargo.toml

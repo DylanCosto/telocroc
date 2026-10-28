@@ -541,7 +541,7 @@ pub fn run(args: &Args, argv: &[String]) -> Result<()> {
     // [6] subtel anchoring
     if !args.debug_noanchor {
         let t = stage("aligning subtels to reference");
-        let records = anchor::align_subtels(
+        let alignments = anchor::align_subtels(
             &subtels_out,
             started_aligner.take(),
             &aligner,
@@ -553,8 +553,7 @@ pub fn run(args: &Args, argv: &[String]) -> Result<()> {
         )?;
         done(t);
         println!("getting anchors from alignment...");
-        let ref_names = resources::reference_names(&anchor_paths.bam)?;
-        anchor::assign_anchors(&records, &ref_names, &mut allele_rows);
+        anchor::assign_anchors(&alignments, &mut allele_rows);
         anchor::sort_alleles(&mut allele_rows);
     }
 

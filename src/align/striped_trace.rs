@@ -665,6 +665,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn per_lane_frames_keep_long_alignments_in_16_bit_lanes() {
         if !is_x86_feature_detected!("avx2") {
             return;
@@ -700,6 +701,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn per_lane_frames_fall_back_when_a_lane_spreads_too_far() {
         if !is_x86_feature_detected!("avx2") {
             return;

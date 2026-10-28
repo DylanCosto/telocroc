@@ -7,6 +7,8 @@ mod cli;
 mod input;
 mod kmers;
 mod linkage;
+#[cfg(target_arch = "aarch64")]
+mod neon;
 mod numpy;
 mod pipeline;
 mod pyrandom;

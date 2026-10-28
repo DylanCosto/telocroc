@@ -278,7 +278,8 @@ mod tests {
     #[test]
     fn batched_matrix_matches_pairwise_distances() {
         let scoring = Scoring::new(Substitution::matrix(b'C', MatrixKind::Tvr), GapKind::Tvr, false);
-        assert!(BatchScorer::new(&scoring).is_some(), "the TVR scheme takes the batched path");
+        // Without a batched kernel this checks the pairwise fallback against itself.
+        assert_eq!(BatchScorer::new(&scoring).is_some(), batch::has_kernel(), "the TVR scheme takes the batched path");
         let mut seed = 3;
         let base: Vec<u8> = (0..1500).map(|_| b"CCCCCCCCCDEFA"[lcg(&mut seed) as usize % 13]).collect();
         // Related sequences (a shared base with mutations) and unrelated ones, of mixed

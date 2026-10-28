@@ -36,6 +36,7 @@ Graviton): AVX2 is used when available on x86-64, and NEON always on aarch64.
 telocroc -i reads.bam -o out/ -r hifi -p 16 --minimap2 /path/to/minimap2
 ```
 
+Input can be FASTA or FASTQ (gzipped or not), BAM, or CRAM (with `--ref`), aligned or unaligned.
 Results are in `out/tlens_by_allele.tsv`; see `telocroc --help` for all options.
 `--igzip /path/to/igzip` (or `igzip` on `PATH`) speeds up gzipped FASTA/FASTQ input.
 

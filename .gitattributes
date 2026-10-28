@@ -1,0 +1,3 @@
+# Helper scripts, not part of telocroc: keep them out of the language stats.
+tools/** linguist-detectable=false
+scripts/** linguist-detectable=false

@@ -4,7 +4,7 @@ Fast allele-specific telomere length from long reads (PacBio HiFi and ONT).
 
 ## Speed
 
-Against Telogator2 2.2.4 on a 10-core desktop (`-p 16`):
+Against Telogator2 2.2.4:
 
 | input | Telogator2 | telocroc | speedup |
 |---|---:|---:|---:|
@@ -12,13 +12,13 @@ Against Telogator2 2.2.4 on a 10-core desktop (`-p 16`):
 | HG002 ONT telomere reads | 22 min 10 s | 67 s | 20x |
 | HG002 Revio HiFi whole-genome BAM (40 GB) | ~5 min | 32 s | ~9x |
 
-The ONT run is mostly minimap2, and the whole-genome run is mostly reading the BAM from disk.
-
 ## Installing
 
 Download a binary for Linux (x86-64, aarch64) or macOS (Apple Silicon) from
 [Releases](https://github.com/DylanCosto/telocroc/releases) and unpack it; the subtelomere
-reference is included. You also need an aligner: minimap2, winnowmap or pbmm2.
+reference is included. You also need an aligner: minimap2, winnowmap, pbmm2, or
+[bonefish](https://github.com/DylanCosto/bonefish), a faster minimap2-compatible aligner
+(`--minimap2 /path/to/bonefish`).
 
 To build from source instead:
 
@@ -54,15 +54,6 @@ Results are in `out/tlens_by_allele.tsv`; see `telocroc --help` for all options.
 
 `qc/stats.tsv` has read and allele counts. `temp/` keeps the telomere reads and the
 subtelomere alignments.
-
-## Differences from Telogator2
-
-- On the HG002 test reads, telocroc finds the same alleles as Telogator2 2.2.4 (HiFi: 96 of
-  98, where Telogator2 splits two alleles that telocroc keeps as one; ONT: 79 of 79). The
-  median telomere-length difference is 2-3 bp.
-- Positions are 0-based, as in Telogator2 2.2.5 (2.2.4 reports them 1 bp higher).
-- No plots (`violin_atl.png`, `all_final_alleles.png`) or `qc/*.npz` files yet. The plotting
-  flags and `--dont-reprocess` are accepted and ignored.
 
 ## Citing
 

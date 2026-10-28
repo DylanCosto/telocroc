@@ -4,8 +4,15 @@ Fast allele-specific telomere length from long reads (PacBio HiFi and ONT).
 
 ## Speed
 
-On a 10-core desktop with `-p 16`: 3,212 HG002 HiFi telomere reads in 55 s, and a whole
-HG002 Revio HiFi BAM (40 GB) in 32 s.
+Against Telogator2 2.2.4 on a 10-core desktop (`-p 16`), with the same alleles found:
+
+| input | Telogator2 | telocroc | speedup |
+|---|---:|---:|---:|
+| HG002 HiFi telomere reads (3,212) | 50 min 54 s | 55 s | 55x |
+| HG002 ONT telomere reads | 22 min 10 s | 67 s | 20x |
+| HG002 Revio HiFi whole-genome BAM (40 GB) | ~5 min | 32 s | ~9x |
+
+The ONT run is mostly minimap2, and the whole-genome run is mostly reading the BAM from disk.
 
 ## Building
 

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # AVX2 kernels
+          - name: x86_64 Linux
+            os: ubuntu-24.04
+          # NEON kernels
+          - name: aarch64 Linux
+            os: ubuntu-24.04-arm
+          - name: aarch64 macOS
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install htslib build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev zlib1g-dev libbz2-dev liblzma-dev
+      - name: Install htslib build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install xz
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets -- -D warnings
+      # Release: the alignment tests run reference aligners on 9,000-letter sequences.
+      - run: cargo test --release

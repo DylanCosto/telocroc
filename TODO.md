@@ -2,9 +2,10 @@
 
 ## Platforms
 
-- [ ] **ARM (aarch64, Apple Silicon):** check that it builds and passes tests (scalar
-      fallback), then port the SIMD kernels to NEON: `align/batch.rs` (16 x 8-bit lanes),
-      `align/striped.rs`, `align/striped_trace.rs`, `screen/packed.rs`.
+- [x] **ARM (aarch64, Apple Silicon):** NEON versions of all four kernels (`src/neon.rs`
+      pairs 128-bit registers so lane counts match AVX2). On an M4 Pro, single thread:
+      batch 28.6, striped 10.1, striped trace 3.3 Gcells/s (scalar: 0.29).
+- [ ] **NEON tuning:** try 8-bit striped lanes for short alignments; profile on Graviton.
 - [ ] **x86 without AVX2:** add a switch that forces the scalar paths, and run the tests with it.
 - [ ] **AVX-512 (AVX512BW):** 64 lanes in the batch kernel, 32 x 16-bit in the striped
       kernels. Needs a Zen 4/5 or Xeon machine to test on (this i5 has no AVX-512).
@@ -27,7 +28,9 @@
 
 ## Testing and validation
 
-- [ ] **CI:** fmt, clippy and tests on x86_64 and aarch64, plus a forced-scalar job.
+- [x] **CI:** fmt, clippy and tests on x86_64 Linux and aarch64 Linux/macOS
+      (`.github/workflows/ci.yml`).
+- [ ] **CI:** a forced-scalar job (needs the x86 scalar switch above).
 - [ ] End-to-end regression test on the bundled HiFi/ONT telomere reads (fetch the test
       data in CI, compare `tlens_by_allele.tsv`).
 - [ ] More ONT samples (R10, ultra-long with telomere coverage); the whole-genome R9

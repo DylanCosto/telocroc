@@ -286,6 +286,9 @@ pub fn cluster_tvrs(
     p: TvrClusterParams,
 ) -> TvrClusters {
     let n = reads.len();
+    if n == 0 {
+        return TvrClusters::default();
+    }
     let for_clustering: Vec<Vec<u8>> =
         colors.iter().map(|c| c.tvrtel[..c.tvrtel.len().min(p.tvr_truncate)].to_vec()).collect();
     let scoring = Scoring::new(Substitution::matrix(letters.canonical, MatrixKind::Tvr), GapKind::Tvr, false);
@@ -412,7 +415,7 @@ pub fn cluster_sequences(
     let mut dist = distance::dist_matrix(&trimmed, &scoring, LengthAdjust::None, SHUFFLES, rng_seed);
     dist.normalize();
     if n <= 1 {
-        return (vec![(0..n).collect()], dist);
+        return ((0..n).map(|i| vec![i]).collect(), dist);
     }
     (sorted_clusters(linkage::cluster(&dist.condensed(), n, method, tree_cut)), dist)
 }

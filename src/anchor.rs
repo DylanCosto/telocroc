@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -243,7 +243,12 @@ fn run_logged(mut cmd: Command, aligner: &Aligner, paths: &AnchorPaths) -> Resul
 
 fn decompress_reference(gz: &Path, out: &Path) -> Result<()> {
     let mut text = Vec::new();
-    MultiGzDecoder::new(File::open(gz).with_context(|| format!("opening {}", gz.display()))?).read_to_end(&mut text)?;
+    let mut input = BufReader::new(File::open(gz).with_context(|| format!("opening {}", gz.display()))?);
+    if input.fill_buf()?.starts_with(&[0x1f, 0x8b]) {
+        MultiGzDecoder::new(input).read_to_end(&mut text)?;
+    } else {
+        input.read_to_end(&mut text)?;
+    }
     fs::write(out, &text)?;
     crate::input::index_fasta(out)
 }
@@ -478,4 +483,29 @@ pub fn sort_alleles(alleles: &mut Vec<AlleleRow>) {
         .collect();
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
     alleles.extend(keyed.into_iter().map(|(_, r)| r));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepare_plain_and_gzip_reference() {
+        let dir = std::env::temp_dir().join(format!("telocroc-reference-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let text = b">CHM13_chr1q\nACGTACGT\n";
+        let plain = dir.join("plain.fa");
+        let gzip = dir.join("compressed.fa.gz");
+        let out = dir.join("prepared.fa");
+        fs::write(&plain, text).unwrap();
+        let mut encoder = GzEncoder::new(File::create(&gzip).unwrap(), Compression::fast());
+        encoder.write_all(text).unwrap();
+        encoder.finish().unwrap();
+        for input in [&plain, &gzip] {
+            decompress_reference(input, &out).unwrap();
+            assert_eq!(fs::read(&out).unwrap(), text);
+            assert!(out.with_added_extension("fai").is_file());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

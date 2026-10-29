@@ -242,6 +242,10 @@ pub fn run(args: &Args, argv: &[String]) -> Result<()> {
         fs::create_dir_all(d).with_context(|| format!("could not create output directory {}", d.display()))?;
     }
     let stats_path = qc_dir.join("stats.tsv");
+    let empty_results = || {
+        write_text(&out_dir.join("tlens_by_allele.tsv"), &AlleleRow::tsv_header(&args.tl_method))?;
+        write_text(&stats_path, &alleles::blank_stats_tsv())
+    };
 
     let rng_seed = if args.rng <= -1 { resources::random_seed() } else { args.rng as u64 };
     write_text(&qc_dir.join("rng.txt"), &format!("{rng_seed}\n"))?;
@@ -326,11 +330,11 @@ pub fn run(args: &Args, argv: &[String]) -> Result<()> {
     );
     if screened.reads.is_empty() {
         println!("Warning: No telomere reads found, stopping here...");
-        return write_text(&stats_path, &alleles::blank_stats_tsv());
+        return empty_results();
     }
     if args.debug_telreads {
         println!("--debug-telreads was specified, stopping now.");
-        return write_text(&stats_path, &alleles::blank_stats_tsv());
+        return empty_results();
     }
 
     let t = stage(&format!("filtering by read length (>{}bp)", args.min_read_len));
@@ -340,7 +344,7 @@ pub fn run(args: &Args, argv: &[String]) -> Result<()> {
     println!(" - {} --> {} reads", all_reads.len() + filtered, all_reads.len());
     if all_reads.is_empty() {
         println!("Warning: No telomere reads remaining, stopping here...");
-        return write_text(&stats_path, &alleles::blank_stats_tsv());
+        return empty_results();
     }
     println!(" - {} reads with methylation data", all_reads.iter().filter(|r| methylated.contains(&r.name)).count());
 
@@ -374,7 +378,7 @@ pub fn run(args: &Args, argv: &[String]) -> Result<()> {
     }
     if reads.is_empty() {
         println!("Warning: No telomere reads remaining, stopping here...");
-        return write_text(&stats_path, &alleles::blank_stats_tsv());
+        return empty_results();
     }
     if args.downsample > 0 && reads.len() > args.downsample as usize {
         let t = stage("downsampling reads");
